@@ -29,6 +29,9 @@ ADMIN_CHAT_ID = 359999840
 # የውይይት ደረጃዎች (Conversation States)
 PHONE, ADDRESS, SCREENSHOT = range(3)
 
+# አዲስ ሽቶ ለመጨመር የሚሆኑ ደረጃዎች
+ADD_NAME, ADD_ML, ADD_PRICE, ADD_STOCK, ADD_PHOTO = range(3, 8)
+
 # ሎግ ማስተካከያ (ለስህተት መከታተያ)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -40,22 +43,28 @@ def init_db():
     conn = sqlite3.connect("perfumes_shop.db")
     cursor = conn.cursor()
 
-    # የሽቶዎች ሰንጠረዥ (Products Table) - stock ዓምድ ታክሏል
+    # የሽቶዎች ሰንጠረዥ (Products Table) - stock, size, photo_id ዓምዶች ታክለዋል
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             price INTEGER NOT NULL,
             description TEXT,
-            stock INTEGER NOT NULL DEFAULT 0
+            stock INTEGER NOT NULL DEFAULT 0,
+            size TEXT,
+            photo_id TEXT
         )
     ''')
 
-    # አስቀድሞ የተፈጠረ ዳታቤዝ ካለ እና stock ዓምድ ከሌለው መጨመር (backward compatibility)
+    # አስቀድሞ የተፈጠረ ዳታቤዝ ካለ እና አዳዲስ ዓምዶች ከሌሉ መጨመር (backward compatibility)
     cursor.execute("PRAGMA table_info(products)")
     columns = [col[1] for col in cursor.fetchall()]
     if "stock" not in columns:
         cursor.execute("ALTER TABLE products ADD COLUMN stock INTEGER NOT NULL DEFAULT 0")
+    if "size" not in columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN size TEXT")
+    if "photo_id" not in columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN photo_id TEXT")
 
     # የትዕዛዞች ሰንጠረዥ (Orders Table)
     cursor.execute('''
@@ -111,33 +120,45 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     conn = sqlite3.connect("perfumes_shop.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, price, description, stock FROM products")
+    cursor.execute("SELECT id, name, price, description, stock, size, photo_id FROM products")
     products = cursor.fetchall()
     conn.close()
     
     await query.edit_message_text("👇 የሚፈልጉትን ሽቶ ይምረጡ፦")
     
     for item in products:
-        p_id, name, price, desc, stock = item
+        p_id, name, price, desc, stock, size, photo_id = item
+
+        display_name = f"{name} ({size})" if size else name
 
         if stock > 0:
             stock_line = f"📦 **ያለው ብዛት:** {stock} ጠርሙስ"
-            button_text = f"🛒 {name} ግዛ"
+            button_text = f"🛒 {display_name} ግዛ"
             callback = f"buy_{p_id}"
         else:
             stock_line = "❌ **ያለቀ (Out of Stock)**"
-            button_text = f"🚫 {name} - አልቋል"
+            button_text = f"🚫 {display_name} - አልቋል"
             callback = "out_of_stock"
 
         text = (
-            f"✨ **ሽቶ:** {name}\n"
+            f"✨ **ሽቶ:** {display_name}\n"
             f"💰 **ዋጋ:** {price} ETB\n"
-            f"📝 **መግለጫ:** {desc}\n"
+            f"📝 **መግለጫ:** {desc or '-'}\n"
             f"{stock_line}"
         )
         keyboard = [[InlineKeyboardButton(button_text, callback_data=callback)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="Markdown", reply_markup=reply_markup)
+
+        if photo_id:
+            await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=photo_id,
+                caption=text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        else:
+            await context.bot.send_message(chat_id=query.message.chat_id, text=text, parse_mode="Markdown", reply_markup=reply_markup)
 
 # ያለቀ እቃ ሲጫን የሚያሳውቅ
 async def out_of_stock_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,7 +384,10 @@ async def stock_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flag = "❌ አልቋል" if stock <= 0 else ("⚠️ እያለቀ ነው" if stock <= 2 else "✅")
         text += f"#{p_id} - {name}: **{stock}** {flag}\n"
 
-    text += "\nስቶክ ለማደስ፦ /restock <product_id> <quantity>\nምሳሌ፦ /restock 1 10"
+    text += (
+        "\nስቶክ ለማደስ፦ /restock <product_id> <quantity>\nምሳሌ፦ /restock 1 10"
+        "\nአዲስ ሽቶ ለመጨመር፦ /addproduct"
+    )
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -406,6 +430,92 @@ async def restock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# --- አዲስ ሽቶ በ ፎቶ፣ size (ml) እና ዋጋ መጨመሪያ (ለአድሚን ብቻ) ---
+
+async def start_add_perfume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ይህ command ወይም inline button ተጭኖ ሊጀመር ይችላል
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        user_id = query.from_user.id
+        reply_target = query.message
+    else:
+        user_id = update.effective_user.id
+        reply_target = update.message
+
+    if user_id != ADMIN_CHAT_ID:
+        if update.callback_query:
+            return ConversationHandler.END
+        await update.message.reply_text("ይህ ትእዛዝ ለአድሚን ብቻ የተፈቀደ ነው!")
+        return ConversationHandler.END
+
+    await reply_target.reply_text("1️⃣ **እባክዎ የሽቶውን ስም አስገቡ** (ለምሳሌ፦ Dior Sauvage)፦", parse_mode="Markdown")
+    return ADD_NAME
+
+async def get_perfume_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['perfume_name'] = update.message.text.strip()
+    await update.message.reply_text("2️⃣ **ስንት ml እንደሆነ አስገቡ** (ለምሳሌ፦ 100ml ወይም 50ml)፦", parse_mode="Markdown")
+    return ADD_ML
+
+async def get_perfume_ml(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['perfume_ml'] = update.message.text.strip()
+    await update.message.reply_text("3️⃣ **የሽቶውን ዋጋ በብር አስገቡ** (ለምሳሌ፦ 4500)፦", parse_mode="Markdown")
+    return ADD_PRICE
+
+async def get_perfume_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    price_text = update.message.text.strip()
+    if not price_text.isdigit():
+        await update.message.reply_text("❗ እባክዎ ዋጋውን በቁጥር ብቻ ያስገቡ (ለምሳሌ፦ 4500)፦")
+        return ADD_PRICE
+
+    context.user_data['perfume_price'] = int(price_text)
+    await update.message.reply_text("4️⃣ **የመነሻ ስቶክ ብዛት አስገቡ** (ለምሳሌ፦ 10)፦", parse_mode="Markdown")
+    return ADD_STOCK
+
+async def get_perfume_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stock_text = update.message.text.strip()
+    if not stock_text.isdigit():
+        await update.message.reply_text("❗ እባክዎ ስቶኩን በቁጥር ብቻ ያስገቡ (ለምሳሌ፦ 10)፦")
+        return ADD_STOCK
+
+    context.user_data['perfume_stock'] = int(stock_text)
+    await update.message.reply_text("5️⃣ **አሁን የሽቶውን ፎቶ ላኩልኝ** 📸፦")
+    return ADD_PHOTO
+
+async def get_perfume_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # የፎቶውን Telegram File ID መያዝ
+    photo_file_id = update.message.photo[-1].file_id
+
+    name = context.user_data['perfume_name']
+    ml = context.user_data['perfume_ml']
+    price = context.user_data['perfume_price']
+    stock = context.user_data['perfume_stock']
+
+    # ዳታቤዝ (SQLite) ውስጥ ማስገባት - ከነባሩ products ሰንጠረዥ ጋር
+    conn = sqlite3.connect("perfumes_shop.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO products (name, price, description, stock, size, photo_id) VALUES (?, ?, ?, ?, ?, ?)",
+        (name, price, "", stock, ml, photo_file_id)
+    )
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ **ሽቶው በትክክል ተመዝግቧል!**\n\n"
+        f"🛍️ **ስም፦** {name}\n"
+        f"📏 **መጠን፦** {ml}\n"
+        f"💰 **ዋጋ፦** {price} ETB\n"
+        f"📦 **የመነሻ ስቶክ፦** {stock}\n"
+        f"📸 **ፎቶ፦** ተያይዟል"
+    )
+    return ConversationHandler.END
+
+async def cancel_add_perfume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("የሽቶ መጨመር ሂደቱ ተሰርዟል።")
+    return ConversationHandler.END
+
+
 # ------------------ 5. ቦቱን ማስነሳት (Main Runner) ------------------
 def main():
     # ዳታቤዝ ማዘጋጀት
@@ -424,6 +534,22 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
+
+    # አዲስ ሽቶ መጨመሪያ ውይይት (ለአድሚን ብቻ)
+    add_product_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("addproduct", start_add_perfume),
+            CallbackQueryHandler(start_add_perfume, pattern="^add_perfume$"),
+        ],
+        states={
+            ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_perfume_name)],
+            ADD_ML: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_perfume_ml)],
+            ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_perfume_price)],
+            ADD_STOCK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_perfume_stock)],
+            ADD_PHOTO: [MessageHandler(filters.PHOTO, get_perfume_photo)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_add_perfume)]
+    )
     
     # Command & Callback Handlers ማገናኘት
     app.add_handler(CommandHandler("start", start))
@@ -433,6 +559,7 @@ def main():
     app.add_handler(CallbackQueryHandler(show_catalog, pattern="^show_catalog$"))
     app.add_handler(CallbackQueryHandler(out_of_stock_notice, pattern="^out_of_stock$"))
     app.add_handler(order_handler)
+    app.add_handler(add_product_handler)
     
     print("🤖 የሽቶ መሸጫ ቴሌግራም ቦት ስራ ጀምሯል...")
     app.run_polling()
