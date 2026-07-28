@@ -45,10 +45,10 @@ logger = logging.getLogger(__name__)
 PHONE, ADDRESS, SCREENSHOT = range(0, 3)
 
 # --- Admin: add new perfume wizard ---
-ADD_NAME, ADD_SIZE, ADD_PRICE, ADD_STOCK, ADD_PHOTO, ADD_MORE = range(3, 9)
+ADD_NAME, ADD_SIZE, ADD_PRICE, ADD_STOCK, ADD_DESC, ADD_PHOTO, ADD_MORE = range(3, 10)
 
 # --- Admin: quick edit price/stock ---
-EDIT_VALUE = 9
+EDIT_VALUE = 10
 
 
 # ============================================================
@@ -373,9 +373,10 @@ async def get_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     await update.message.reply_text(
-        "ወዲያውኑ ደርሶናል! 🙏\n\n"
-        "ትዕዛዝዎ በስኬት ተመዝግቧል። የላኩትን ደረሰኝ አይተን በቅርብ ደቂቃዎች ውስጥ በስልክ ቁጥርዎ እንደውላለን!\n"
-        "ስለመረጡን እናመሰግናለን! ✨"
+        "🙏 <b>እናመሰግናለን!</b>\n\n"
+        "✅ <b>ትዕዛዝዎ በስኬት ደርሶናል!</b>\n"
+        "📦 እቃዎ <b>በነገው ዕለት</b> የሚደርስዎት ሲሆን፣ የዴሊቨሪ አጋራችን ከመምጣቱ በፊት በስልክ ቁጥርዎ ይደውልልዎታል።",
+        parse_mode="HTML",
     )
 
     admin_notification = (
@@ -592,7 +593,13 @@ async def get_perfume_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_STOCK
 
     context.user_data["new_product"]["stock"] = int(stock_text)
-    await update.message.reply_text("5️⃣ **አሁን የሽቶውን ፎቶ ላኩልኝ** 📸፦")
+    await update.message.reply_text("5️⃣ **የሽቶውን መግለጫ (Description) አስገቡ**፦", parse_mode="Markdown")
+    return ADD_DESC
+
+
+async def get_perfume_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_product"]["description"] = update.message.text.strip()
+    await update.message.reply_text("6️⃣ **አሁን የሽቶውን ፎቶ ላኩልኝ** 📸፦")
     return ADD_PHOTO
 
 
@@ -609,7 +616,7 @@ async def get_perfume_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor.execute(
         "INSERT INTO products (name, price, description, stock, size, photo_id, is_active) "
         "VALUES (?, ?, ?, ?, ?, ?, 1)",
-        (data.get("name"), data.get("price"), "", data.get("stock"), data.get("size"), photo_file_id),
+        (data.get("name"), data.get("price"), data.get("description", ""), data.get("stock"), data.get("size"), photo_file_id),
     )
     conn.commit()
     conn.close()
@@ -620,6 +627,7 @@ async def get_perfume_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📏 **መጠን፦** {data.get('size')}\n"
         f"💰 **ዋጋ፦** {format_price(data.get('price'))} ETB\n"
         f"📦 **የመነሻ ስቶክ፦** {data.get('stock')}\n"
+        f"📝 **መግለጫ፦** {data.get('description')}\n"
         f"📸 **ፎቶ፦** ተያይዟል",
         parse_mode="Markdown",
     )
@@ -896,6 +904,7 @@ def main():
             ADD_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_perfume_size)],
             ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_perfume_price)],
             ADD_STOCK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_perfume_stock)],
+            ADD_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_perfume_description)],
             ADD_PHOTO: [MessageHandler(filters.PHOTO, get_perfume_photo)],
             ADD_MORE: [
                 CallbackQueryHandler(add_another_callback, pattern="^add_another$"),
