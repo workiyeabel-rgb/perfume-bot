@@ -1,8 +1,6 @@
 import logging
-import os
 import sqlite3
 from datetime import date
-from pathlib import Path
 
 from telegram import (
     Update,
@@ -21,22 +19,14 @@ from telegram.ext import (
     ConversationHandler,
     filters,
 )
-from telegram.helpers import escape_markdown
 
 # ============================================================
 # 1. CONFIG
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "359999840"))
+BOT_TOKEN = "8229134590:AAHq9xub04wJef4RUFVzTDrnmbgb5gQ5L7I"
+ADMIN_CHAT_ID = 359999840
 
-# Defaults to the writable path granted by perfume-bot.service
-# (ReadWritePaths=/var/lib/perfume-bot). Override with DATABASE_PATH if needed.
-DB_PATH = Path(
-    os.getenv(
-        "DATABASE_PATH",
-        "/var/lib/perfume-bot/perfumes_shop.db",
-    )
-)
+DB_PATH = "perfumes_shop.db"
 ADVANCE_PAYMENT = 500  # ETB required as pre-payment to confirm an order
 LOW_STOCK_THRESHOLD = 2
 
@@ -45,25 +35,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-# httpx includes the full Telegram API URL (and bot token) in INFO messages.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-# Non-blocking startup warnings: the bot will still run with these fallback
-# values (as requested), but misconfiguration should be visible in the logs
-# rather than silently routing admin notifications to the wrong chat, or
-# silently failing every Telegram API call with a placeholder token.
-if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-    logger.warning(
-        "BOT_TOKEN is not set (using placeholder) - the bot will fail to "
-        "connect to Telegram until BOT_TOKEN is set in /etc/perfume-bot.env"
-    )
-if not os.getenv("ADMIN_CHAT_ID"):
-    logger.warning(
-        "ADMIN_CHAT_ID is not set - falling back to hardcoded default %s. "
-        "Order notifications and admin commands will go to that chat ID "
-        "until ADMIN_CHAT_ID is set in /etc/perfume-bot.env",
-        ADMIN_CHAT_ID,
-    )
 
 # ============================================================
 # 2. CONVERSATION STATES
@@ -79,18 +50,18 @@ ADD_NAME, ADD_SIZE, ADD_PRICE, ADD_STOCK, ADD_DESC, ADD_PHOTO, ADD_MORE = range(
 # --- Admin: quick edit price/stock ---
 EDIT_VALUE = 10
 
+# --- Admin: edit payment accounts ---
+SETTINGS_VALUE = 11
+
 
 # ============================================================
 # 3. DATABASE
 # ============================================================
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return sqlite3.connect(DB_PATH)
 
 
 def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = get_conn()
     cursor = conn.cursor()
 
@@ -155,8 +126,55 @@ def init_db():
             sample_products,
         )
 
+    # --- Settings table (used for admin-editable values like payment accounts) ---
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    ''')
+
+    default_settings = {
+        "telebirr_number": "0912345678",
+        "telebirr_name": "ስም",
+        "cbe_number": "1000123456789",
+        "cbe_name": "ስም",
+    }
+    for key, value in default_settings.items():
+        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
     conn.commit()
     conn.close()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_payment_accounts() -> dict:
+    return {
+        "telebirr_number": get_setting("telebirr_number", "0912345678"),
+        "telebirr_name": get_setting("telebirr_name", "ስም"),
+        "cbe_number": get_setting("cbe_number", "1000123456789"),
+        "cbe_name": get_setting("cbe_name", "ስም"),
+    }
 
 
 # ============================================================
@@ -164,16 +182,6 @@ def init_db():
 # ============================================================
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_CHAT_ID
-
-
-def esc(text) -> str:
-    """Escape legacy Markdown (parse_mode='Markdown') special characters
-    in free-text that came from a user or admin (product name, size,
-    description, phone, address), so a stray _ * ` [ can never break or
-    crash a message send."""
-    if text is None:
-        return ""
-    return escape_markdown(str(text), version=1)
 
 
 def format_price(value) -> str:
@@ -205,6 +213,7 @@ def admin_main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💰 Edit Prices & Stock", callback_data="admin_edit_menu")],
         [InlineKeyboardButton("🛍️ View Catalog", callback_data="admin_view_catalog")],
         [InlineKeyboardButton("🗑️ Delete / Manage Inventory", callback_data="admin_delete_menu")],
+        [InlineKeyboardButton("💳 Edit Payment Accounts", callback_data="admin_payment_menu")],
         [InlineKeyboardButton("📊 Sales & Order Summary", callback_data="admin_stats")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -261,7 +270,7 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for p_id, name, price, desc, stock, size, photo_id in products:
-        display_name = f"{esc(name)} ({esc(size)})" if size else esc(name)
+        display_name = f"{name} ({size})" if size else name
 
         if stock > 0:
             stock_line = f"📦 **ያለው ብዛት:** {stock}"
@@ -275,7 +284,7 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = (
             f"✨ **{display_name}**\n"
             f"💰 **ዋጋ:** {format_price(price)} ETB\n"
-            f"📝 {esc(desc) if desc else '-'}\n"
+            f"📝 {desc or '-'}\n"
             f"{stock_line}"
         )
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(button_text, callback_data=callback)]])
@@ -337,7 +346,7 @@ async def select_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await query.message.reply_text(
-        f"🎯 **የመረጡት ሽቶ:** {esc(context.user_data['order_product_name'])}\n"
+        f"🎯 **የመረጡት ሽቶ:** {context.user_data['order_product_name']}\n"
         f"💰 **ዋጋ:** {format_price(price)} ETB\n\n"
         "እባክዎን ትዕዛዝዎን ለማጠናቀቅ **የስልክ ቁጥርዎን** ያስገቡ (ወይም 'ስልክ ቁጥሬን አጋራ' የሚለውን ይጫኑ)፦",
         parse_mode="Markdown",
@@ -364,12 +373,13 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["order_address"] = update.message.text
 
+    accounts = get_payment_accounts()
     payment_instruction = (
         "💳 **የቅድመ-ክፍያ ማረጋገጫ (Advance Payment)**\n\n"
         f"ትዕዛዝዎን ለማረጋገጥ እባክዎን **{ADVANCE_PAYMENT} ETB** በ Telebirr ወይም በባንክ ሂሳባችን ገቢ ያድርጉ።\n\n"
         "📲 **Telebirr / CBE Accounts:**\n"
-        "• Telebirr: 0912345678 (ስም)\n"
-        "• CBE Bank: 1000123456789 (ስም)\n\n"
+        f"• Telebirr: {accounts['telebirr_number']} ({accounts['telebirr_name']})\n"
+        f"• CBE Bank: {accounts['cbe_number']} ({accounts['cbe_name']})\n\n"
         "📌 ክፍያውን እንደፈፀሙ **የክፍያውን ደረሰኝ (Screenshot/ፎቶ)** እዚህ ይላኩልን።"
     )
     await update.message.reply_text(payment_instruction, parse_mode="Markdown")
@@ -390,13 +400,11 @@ async def get_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     cursor = conn.cursor()
 
-    # Atomic, race-safe stock deduction: the conditional UPDATE is the single
-    # source of truth. The order is only ever inserted if this UPDATE actually
-    # decremented a row (rowcount > 0), so two customers racing for the last
-    # unit can never both end up with a confirmed order.
-    cursor.execute("UPDATE products SET stock = stock - 1 WHERE id = ? AND stock > 0", (product_id,))
-    if cursor.rowcount == 0:
-        conn.rollback()
+    cursor.execute("SELECT stock FROM products WHERE id = ?", (product_id,))
+    row = cursor.fetchone()
+    current_stock = row[0] if row else 0
+
+    if current_stock <= 0:
         conn.close()
         await update.message.reply_text(
             "ይቅርታ፣ ይህ ሽቶ ገቢ ሲደረግልዎት ተጠናቅቆ ነበር። እባክዎ ሌላ ሽቶ ይምረጡ ወይም ድጋፍ ያግኙ።"
@@ -409,6 +417,7 @@ async def get_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
         (user_id, product_id, product_name, price, phone, address, today),
     )
+    cursor.execute("UPDATE products SET stock = stock - 1 WHERE id = ? AND stock > 0", (product_id,))
     cursor.execute("SELECT stock FROM products WHERE id = ?", (product_id,))
     remaining_stock = cursor.fetchone()[0]
 
@@ -424,10 +433,10 @@ async def get_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_notification = (
         "🚨 **አዲስ ትዕዛዝ ገብቷል!** 🚨\n\n"
-        f"🛍️ **የተመረጠው ሽቶ:** {esc(product_name)}\n"
+        f"🛍️ **የተመረጠው ሽቶ:** {product_name}\n"
         f"💰 **ሙሉ ዋጋ:** {format_price(price)} ETB\n"
-        f"📱 **ስልክ ቁጥር:** {esc(phone)}\n"
-        f"📍 **ማድረሻ አድራሻ:** {esc(address)}\n"
+        f"📱 **ስልክ ቁጥር:** {phone}\n"
+        f"📍 **ማድረሻ አድራሻ:** {address}\n"
         f"💵 **ቅድመ ክፍያ:** {ADVANCE_PAYMENT} ETB (ደረሰኝ ከታች ተያይዟል)\n"
         f"📦 **የቀረ ስቶክ:** {remaining_stock}"
     )
@@ -500,7 +509,7 @@ async def admin_view_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     for p_id, name, price, desc, stock, size, photo_id, is_active in products:
-        display_name = f"{esc(name)} ({esc(size)})" if size else esc(name)
+        display_name = f"{name} ({size})" if size else name
         if not is_active:
             status = "🙈 **ተደብቋል (Hidden)**"
         elif stock > 0:
@@ -511,7 +520,7 @@ async def admin_view_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE)
         caption = (
             f"#{p_id} ✨ **{display_name}**\n"
             f"💰 {format_price(price)} ETB\n"
-            f"📝 {esc(desc) if desc else '-'}\n"
+            f"📝 {desc or '-'}\n"
             f"{status}"
         )
         if photo_id:
@@ -567,7 +576,7 @@ async def send_stats(chat_id, context: ContextTypes.DEFAULT_TYPE):
         text += "⚠️ **ዝቅተኛ/ያለቀ ስቶክ፦**\n"
         for name, stock in low_stock:
             flag = "❌ አልቋል" if stock <= 0 else f"⚠️ {stock} ቀርቷል"
-            text += f"• {esc(name)} — {flag}\n"
+            text += f"• {name} — {flag}\n"
     else:
         text += "✅ ሁሉም ምርቶች በቂ ስቶክ አላቸው።"
 
@@ -666,11 +675,11 @@ async def get_perfume_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ **ሽቶው በትክክል ተመዝግቧል!**\n\n"
-        f"🛍️ **ስም፦** {esc(data.get('name'))}\n"
-        f"📏 **መጠን፦** {esc(data.get('size'))}\n"
+        f"🛍️ **ስም፦** {data.get('name')}\n"
+        f"📏 **መጠን፦** {data.get('size')}\n"
         f"💰 **ዋጋ፦** {format_price(data.get('price'))} ETB\n"
         f"📦 **የመነሻ ስቶክ፦** {data.get('stock')}\n"
-        f"📝 **መግለጫ፦** {esc(data.get('description'))}\n"
+        f"📝 **መግለጫ፦** {data.get('description')}\n"
         f"📸 **ፎቶ፦** ተያይዟል",
         parse_mode="Markdown",
     )
@@ -759,7 +768,7 @@ async def admin_edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⬅️ Back", callback_data="admin_edit_menu")],
     ]
     await query.edit_message_text(
-        f"🛍️ **{esc(name)} ({esc(size)})**\n💰 ዋጋ: {format_price(price)} ETB\n📦 ስቶክ: {stock}\n\nምን ማስተካከል ይፈልጋሉ?",
+        f"🛍️ **{name} ({size})**\n💰 ዋጋ: {format_price(price)} ETB\n📦 ስቶክ: {stock}\n\nምን ማስተካከል ይፈልጋሉ?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -818,7 +827,7 @@ async def admin_save_edit_value(update: Update, context: ContextTypes.DEFAULT_TY
         cursor.execute("UPDATE products SET price = ? WHERE id = ?", (new_price, product_id))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ የ **{esc(name)}** ዋጋ ወደ **{format_price(new_price)} ETB** ተቀይሯል።", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ የ **{name}** ዋጋ ወደ **{format_price(new_price)} ETB** ተቀይሯል።", parse_mode="Markdown")
     else:
         if not (text.lstrip("-").isdigit()):
             await update.message.reply_text("❗ ትክክለኛ ቁጥር ያስገቡ (ለምሳሌ፦ 10 ወይም -3)፦")
@@ -829,7 +838,7 @@ async def admin_save_edit_value(update: Update, context: ContextTypes.DEFAULT_TY
         cursor.execute("UPDATE products SET stock = ? WHERE id = ?", (new_stock, product_id))
         conn.commit()
         conn.close()
-        await update.message.reply_text(f"✅ የ **{esc(name)}** ስቶክ ከ {stock} ወደ **{new_stock}** ተቀይሯል።", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ የ **{name}** ስቶክ ከ {stock} ወደ **{new_stock}** ተቀይሯል።", parse_mode="Markdown")
 
     context.user_data.clear()
     await send_admin_menu(update.effective_chat.id, context)
@@ -837,6 +846,84 @@ async def admin_save_edit_value(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("ማስተካከያው ተሰርዟል።")
+    if is_admin(update.effective_user.id):
+        await send_admin_menu(update.effective_chat.id, context)
+    return ConversationHandler.END
+
+
+# ============================================================
+# 8b. ADMIN: EDIT PAYMENT ACCOUNTS (isolated ConversationHandler)
+# ============================================================
+SETTINGS_FIELD_LABELS = {
+    "telebirr_number": "የቴሌብር ቁጥር (Telebirr Number)",
+    "telebirr_name": "የቴሌብር ስም (Telebirr Name)",
+    "cbe_number": "የ CBE ሂሳብ ቁጥር (CBE Account Number)",
+    "cbe_name": "የ CBE ስም (CBE Name)",
+}
+
+
+async def admin_payment_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+
+    accounts = get_payment_accounts()
+    text = (
+        "💳 **Edit Payment Accounts**\n\n"
+        f"📲 **Telebirr:** {accounts['telebirr_number']} ({accounts['telebirr_name']})\n"
+        f"🏦 **CBE:** {accounts['cbe_number']} ({accounts['cbe_name']})\n\n"
+        "የትኛውን ማስተካከል ይፈልጋሉ?"
+    )
+    keyboard = [
+        [InlineKeyboardButton("✏️ Telebirr Number", callback_data="admin_edit_setting_telebirr_number")],
+        [InlineKeyboardButton("✏️ Telebirr Name", callback_data="admin_edit_setting_telebirr_name")],
+        [InlineKeyboardButton("✏️ CBE Number", callback_data="admin_edit_setting_cbe_number")],
+        [InlineKeyboardButton("✏️ CBE Name", callback_data="admin_edit_setting_cbe_name")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="admin_menu")],
+    ]
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def admin_edit_setting_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return ConversationHandler.END
+
+    # callback_data format: admin_edit_setting_<key>  e.g. admin_edit_setting_telebirr_number
+    setting_key = query.data[len("admin_edit_setting_"):]
+    context.user_data["edit_setting_key"] = setting_key
+
+    label = SETTINGS_FIELD_LABELS.get(setting_key, setting_key)
+    current_value = get_setting(setting_key)
+    await query.message.reply_text(
+        f"✏️ **{label}** አዲሱን ዋጋ ያስገቡ።\nየአሁኑ ዋጋ፦ {current_value}\n\n/cancel ብለው ማቆም ይችላሉ።",
+        parse_mode="Markdown",
+    )
+    return SETTINGS_VALUE
+
+
+async def admin_save_setting_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    setting_key = context.user_data.get("edit_setting_key")
+    new_value = update.message.text.strip()
+
+    if not setting_key or not new_value:
+        await update.message.reply_text("❗ ትክክለኛ ዋጋ ያስገቡ፦")
+        return SETTINGS_VALUE
+
+    set_setting(setting_key, new_value)
+    label = SETTINGS_FIELD_LABELS.get(setting_key, setting_key)
+    await update.message.reply_text(f"✅ **{label}** ወደ **{new_value}** ተቀይሯል።", parse_mode="Markdown")
+
+    context.user_data.clear()
+    await send_admin_menu(update.effective_chat.id, context)
+    return ConversationHandler.END
+
+
+async def cancel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("ማስተካከያው ተሰርዟል።")
     if is_admin(update.effective_user.id):
@@ -930,33 +1017,11 @@ async def admin_toggle_active(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ============================================================
-# 10. GLOBAL ERROR HANDLER
-# ============================================================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catches any exception raised in a handler so it's logged instead of
-    silently swallowed, and (where possible) tells the user something went
-    wrong instead of leaving them with no response at all."""
-    logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
-
-    if isinstance(update, Update):
-        chat = update.effective_chat
-        if chat is not None:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text="⚠️ የስርዓት ችግር ተፈጥሯል። እባክዎ /start በመጫን እንደገና ይሞክሩ።",
-                )
-            except Exception:
-                logger.exception("Failed to notify user about the error")
-
-
-# ============================================================
-# 11. MAIN
+# 10. MAIN
 # ============================================================
 def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_error_handler(error_handler)
 
     # --- Admin: Add New Perfume wizard ---
     add_product_conv = ConversationHandler(
@@ -994,6 +1059,22 @@ def main():
         persistent=False,
     )
 
+    # --- Admin: Edit payment accounts ---
+    settings_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                admin_edit_setting_prompt,
+                pattern=r"^admin_edit_setting_(telebirr_number|telebirr_name|cbe_number|cbe_name)$",
+            ),
+        ],
+        states={
+            SETTINGS_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_setting_value)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_settings)],
+        name="settings_conv",
+        persistent=False,
+    )
+
     # --- Customer ordering flow ---
     order_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(select_product, pattern="^buy_")],
@@ -1021,6 +1102,7 @@ def main():
 
     app.add_handler(add_product_conv)
     app.add_handler(edit_conv)
+    app.add_handler(settings_conv)
 
     app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern="^admin_menu$"))
     app.add_handler(CallbackQueryHandler(admin_view_catalog, pattern="^admin_view_catalog$"))
@@ -1030,6 +1112,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_delete_menu, pattern="^admin_delete_menu$"))
     app.add_handler(CallbackQueryHandler(admin_delete_confirm, pattern=r"^admin_delete_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_toggle_active, pattern=r"^admin_toggle_\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_payment_menu, pattern="^admin_payment_menu$"))
 
     app.add_handler(CallbackQueryHandler(show_catalog, pattern="^show_catalog$"))
     app.add_handler(CallbackQueryHandler(out_of_stock_notice, pattern="^out_of_stock$"))
