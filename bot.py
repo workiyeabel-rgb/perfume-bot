@@ -1,6 +1,8 @@
 import logging
+import os
 import sqlite3
 from datetime import date
+from pathlib import Path
 
 from telegram import (
     Update,
@@ -23,10 +25,14 @@ from telegram.ext import (
 # ============================================================
 # 1. CONFIG
 # ============================================================
-BOT_TOKEN = "8229134590:AAHq9xub04wJef4RUFVzTDrnmbgb5gQ5L7I"
-ADMIN_CHAT_ID = 359999840
-
-DB_PATH = "perfumes_shop.db"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "359999840"))
+DB_PATH = Path(
+    os.environ.get(
+        "DATABASE_PATH",
+        str(Path(__file__).resolve().with_name("perfumes_shop.db")),
+    )
+)
 ADVANCE_PAYMENT = 500  # ETB required as pre-payment to confirm an order
 LOW_STOCK_THRESHOLD = 2
 
@@ -35,6 +41,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# httpx includes the full Telegram API URL (and bot token) in INFO messages.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ============================================================
 # 2. CONVERSATION STATES
@@ -50,9 +58,6 @@ ADD_NAME, ADD_SIZE, ADD_PRICE, ADD_STOCK, ADD_DESC, ADD_PHOTO, ADD_MORE = range(
 # --- Admin: quick edit price/stock ---
 EDIT_VALUE = 10
 
-# --- Admin: edit payment accounts ---
-SETTINGS_VALUE = 11
-
 
 # ============================================================
 # 3. DATABASE
@@ -62,6 +67,7 @@ def get_conn():
 
 
 def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = get_conn()
     cursor = conn.cursor()
 
@@ -126,55 +132,8 @@ def init_db():
             sample_products,
         )
 
-    # --- Settings table (used for admin-editable values like payment accounts) ---
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    ''')
-
-    default_settings = {
-        "telebirr_number": "0912345678",
-        "telebirr_name": "ስም",
-        "cbe_number": "1000123456789",
-        "cbe_name": "ስም",
-    }
-    for key, value in default_settings.items():
-        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
-
     conn.commit()
     conn.close()
-
-
-def get_setting(key: str, default: str = "") -> str:
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else default
-
-
-def set_setting(key: str, value: str):
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_payment_accounts() -> dict:
-    return {
-        "telebirr_number": get_setting("telebirr_number", "0912345678"),
-        "telebirr_name": get_setting("telebirr_name", "ስም"),
-        "cbe_number": get_setting("cbe_number", "1000123456789"),
-        "cbe_name": get_setting("cbe_name", "ስም"),
-    }
 
 
 # ============================================================
@@ -213,7 +172,6 @@ def admin_main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💰 Edit Prices & Stock", callback_data="admin_edit_menu")],
         [InlineKeyboardButton("🛍️ View Catalog", callback_data="admin_view_catalog")],
         [InlineKeyboardButton("🗑️ Delete / Manage Inventory", callback_data="admin_delete_menu")],
-        [InlineKeyboardButton("💳 Edit Payment Accounts", callback_data="admin_payment_menu")],
         [InlineKeyboardButton("📊 Sales & Order Summary", callback_data="admin_stats")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -373,13 +331,12 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["order_address"] = update.message.text
 
-    accounts = get_payment_accounts()
     payment_instruction = (
         "💳 **የቅድመ-ክፍያ ማረጋገጫ (Advance Payment)**\n\n"
         f"ትዕዛዝዎን ለማረጋገጥ እባክዎን **{ADVANCE_PAYMENT} ETB** በ Telebirr ወይም በባንክ ሂሳባችን ገቢ ያድርጉ።\n\n"
         "📲 **Telebirr / CBE Accounts:**\n"
-        f"• Telebirr: {accounts['telebirr_number']} ({accounts['telebirr_name']})\n"
-        f"• CBE Bank: {accounts['cbe_number']} ({accounts['cbe_name']})\n\n"
+        "• Telebirr: 0912345678 (ስም)\n"
+        "• CBE Bank: 1000123456789 (ስም)\n\n"
         "📌 ክፍያውን እንደፈፀሙ **የክፍያውን ደረሰኝ (Screenshot/ፎቶ)** እዚህ ይላኩልን።"
     )
     await update.message.reply_text(payment_instruction, parse_mode="Markdown")
@@ -854,84 +811,6 @@ async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# 8b. ADMIN: EDIT PAYMENT ACCOUNTS (isolated ConversationHandler)
-# ============================================================
-SETTINGS_FIELD_LABELS = {
-    "telebirr_number": "የቴሌብር ቁጥር (Telebirr Number)",
-    "telebirr_name": "የቴሌብር ስም (Telebirr Name)",
-    "cbe_number": "የ CBE ሂሳብ ቁጥር (CBE Account Number)",
-    "cbe_name": "የ CBE ስም (CBE Name)",
-}
-
-
-async def admin_payment_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        return
-
-    accounts = get_payment_accounts()
-    text = (
-        "💳 **Edit Payment Accounts**\n\n"
-        f"📲 **Telebirr:** {accounts['telebirr_number']} ({accounts['telebirr_name']})\n"
-        f"🏦 **CBE:** {accounts['cbe_number']} ({accounts['cbe_name']})\n\n"
-        "የትኛውን ማስተካከል ይፈልጋሉ?"
-    )
-    keyboard = [
-        [InlineKeyboardButton("✏️ Telebirr Number", callback_data="admin_edit_setting_telebirr_number")],
-        [InlineKeyboardButton("✏️ Telebirr Name", callback_data="admin_edit_setting_telebirr_name")],
-        [InlineKeyboardButton("✏️ CBE Number", callback_data="admin_edit_setting_cbe_number")],
-        [InlineKeyboardButton("✏️ CBE Name", callback_data="admin_edit_setting_cbe_name")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="admin_menu")],
-    ]
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def admin_edit_setting_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        return ConversationHandler.END
-
-    # callback_data format: admin_edit_setting_<key>  e.g. admin_edit_setting_telebirr_number
-    setting_key = query.data[len("admin_edit_setting_"):]
-    context.user_data["edit_setting_key"] = setting_key
-
-    label = SETTINGS_FIELD_LABELS.get(setting_key, setting_key)
-    current_value = get_setting(setting_key)
-    await query.message.reply_text(
-        f"✏️ **{label}** አዲሱን ዋጋ ያስገቡ።\nየአሁኑ ዋጋ፦ {current_value}\n\n/cancel ብለው ማቆም ይችላሉ።",
-        parse_mode="Markdown",
-    )
-    return SETTINGS_VALUE
-
-
-async def admin_save_setting_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    setting_key = context.user_data.get("edit_setting_key")
-    new_value = update.message.text.strip()
-
-    if not setting_key or not new_value:
-        await update.message.reply_text("❗ ትክክለኛ ዋጋ ያስገቡ፦")
-        return SETTINGS_VALUE
-
-    set_setting(setting_key, new_value)
-    label = SETTINGS_FIELD_LABELS.get(setting_key, setting_key)
-    await update.message.reply_text(f"✅ **{label}** ወደ **{new_value}** ተቀይሯል።", parse_mode="Markdown")
-
-    context.user_data.clear()
-    await send_admin_menu(update.effective_chat.id, context)
-    return ConversationHandler.END
-
-
-async def cancel_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("ማስተካከያው ተሰርዟል።")
-    if is_admin(update.effective_user.id):
-        await send_admin_menu(update.effective_chat.id, context)
-    return ConversationHandler.END
-
-
-# ============================================================
 # 9. ADMIN: DELETE / HIDE INVENTORY (plain callbacks, no conversation needed)
 # ============================================================
 async def admin_delete_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1020,6 +899,9 @@ async def admin_toggle_active(update: Update, context: ContextTypes.DEFAULT_TYPE
 # 10. MAIN
 # ============================================================
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is required")
+
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1059,22 +941,6 @@ def main():
         persistent=False,
     )
 
-    # --- Admin: Edit payment accounts ---
-    settings_conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(
-                admin_edit_setting_prompt,
-                pattern=r"^admin_edit_setting_(telebirr_number|telebirr_name|cbe_number|cbe_name)$",
-            ),
-        ],
-        states={
-            SETTINGS_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_save_setting_value)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_settings)],
-        name="settings_conv",
-        persistent=False,
-    )
-
     # --- Customer ordering flow ---
     order_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(select_product, pattern="^buy_")],
@@ -1102,7 +968,6 @@ def main():
 
     app.add_handler(add_product_conv)
     app.add_handler(edit_conv)
-    app.add_handler(settings_conv)
 
     app.add_handler(CallbackQueryHandler(admin_menu_callback, pattern="^admin_menu$"))
     app.add_handler(CallbackQueryHandler(admin_view_catalog, pattern="^admin_view_catalog$"))
@@ -1112,7 +977,6 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_delete_menu, pattern="^admin_delete_menu$"))
     app.add_handler(CallbackQueryHandler(admin_delete_confirm, pattern=r"^admin_delete_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_toggle_active, pattern=r"^admin_toggle_\d+$"))
-    app.add_handler(CallbackQueryHandler(admin_payment_menu, pattern="^admin_payment_menu$"))
 
     app.add_handler(CallbackQueryHandler(show_catalog, pattern="^show_catalog$"))
     app.add_handler(CallbackQueryHandler(out_of_stock_notice, pattern="^out_of_stock$"))
