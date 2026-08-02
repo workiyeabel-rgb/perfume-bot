@@ -523,14 +523,25 @@ async def render_catalog_page(chat_id, context: ContextTypes.DEFAULT_TYPE, page:
             f"📝 {escape_md(desc) or '-'}\n"
             f"💰 {price_line}\n"
         )
-        if in_stock:
-            caption += "📦 ይገኛል"
-            button = InlineKeyboardButton("🛒 ይምረጡ (Select)", callback_data=f"selectp_{p_id}")
-        else:
-            caption += "❌ *ያለቀ (Out of Stock)*"
-            button = InlineKeyboardButton("🚫 አልቋል", callback_data="out_of_stock")
+        caption += "📦 ይገኛል" if in_stock else "❌ *ያለቀ (Out of Stock)*"
 
-        keyboard = InlineKeyboardMarkup([[button]])
+        # Size buttons sit directly on the product card, side by side
+        # (e.g. [30ml - 1500 ETB] [50ml - 2500 ETB] [100ml - 4500 ETB])
+        # instead of opening a separate "choose a size" screen.
+        if variants:
+            variant_buttons = []
+            for v_id, size, price, stock in variants:
+                if stock > 0:
+                    label = f"{size} - {format_price(price)} ETB"
+                    variant_buttons.append(InlineKeyboardButton(label, callback_data=f"selectv_{v_id}"))
+                else:
+                    variant_buttons.append(InlineKeyboardButton(f"❌ {size}", callback_data="variant_oos"))
+            # Wrap into rows of 3 so it stays horizontal even if a perfume has many sizes
+            rows = [variant_buttons[i:i + 3] for i in range(0, len(variant_buttons), 3)]
+        else:
+            rows = [[InlineKeyboardButton("🚫 አልቋል", callback_data="out_of_stock")]]
+
+        keyboard = InlineKeyboardMarkup(rows)
         msg = await send_product_card(context.bot, chat_id, photo_id, photo_type, caption, keyboard)
         sent_ids.append(msg.message_id)
         await asyncio.sleep(SEND_DELAY)
@@ -579,48 +590,8 @@ async def variant_oos_notice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.callback_query.answer("ይቅርታ፣ ይህ መጠን በአሁኑ ሰዓት አልቋል።", show_alert=True)
 
 
-async def select_product_variants(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Customer picked a perfume from the catalog -> show its available sizes."""
-    query = update.callback_query
-    product_id = int(query.data.split("_")[1])
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM products WHERE id = ? AND is_active = 1", (product_id,))
-    row = cur.fetchone()
-    conn.close()
-
-    if row is None:
-        await query.answer("ይህ ሽቶ አልተገኘም።", show_alert=True)
-        return
-    name = row[0]
-
-    variants = fetch_variants(product_id)
-    if not variants:
-        await query.answer("ለዚህ ሽቶ ምንም አማራጭ መጠን የለም።", show_alert=True)
-        return
-
-    await query.answer()
-    buttons = []
-    for v_id, size, price, stock in variants:
-        if stock > 0:
-            label = f"{size} - {format_price(price)} ETB"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"selectv_{v_id}")])
-        else:
-            buttons.append([InlineKeyboardButton(f"❌ {size} - ያለቀ", callback_data="variant_oos")])
-
-    back_page = context.user_data.get("catalog_page", 0)
-    buttons.append([InlineKeyboardButton("⬅️ ተመለስ", callback_data=f"catalogpage_{back_page}")])
-
-    await query.message.reply_text(
-        f"🎯 *{escape_md(name)}*\nመጠን ይምረጡ፦",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-
 async def select_variant(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Customer picked a size -> show quantity options."""
+    """Customer tapped a size button directly on the catalog card -> show quantity options."""
     query = update.callback_query
     variant_id = int(query.data.split("_")[1])
 
@@ -649,7 +620,8 @@ async def select_variant(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton(str(n), callback_data=f"qty_{variant_id}_{n}")
         for n in range(1, max_qty + 1)
     ]
-    keyboard = [qty_buttons, [InlineKeyboardButton("⬅️ ተመለስ", callback_data=f"selectp_{product_id}")]]
+    back_page = context.user_data.get("catalog_page", 0)
+    keyboard = [qty_buttons, [InlineKeyboardButton("⬅️ ተመለስ", callback_data=f"catalogpage_{back_page}")]]
 
     await query.message.reply_text(
         f"🎯 *{escape_md(name)} ({escape_md(size)})*\n💰 {format_price(price)} ETB\n\n"
@@ -1777,7 +1749,6 @@ def main():
     app.add_handler(CallbackQueryHandler(go_home, pattern="^go_home$"))
     app.add_handler(CallbackQueryHandler(out_of_stock_notice, pattern="^out_of_stock$"))
     app.add_handler(CallbackQueryHandler(variant_oos_notice, pattern="^variant_oos$"))
-    app.add_handler(CallbackQueryHandler(select_product_variants, pattern=r"^selectp_\d+$"))
     app.add_handler(CallbackQueryHandler(select_variant, pattern=r"^selectv_\d+$"))
 
     # Standalone /cancel for when no conversation is currently active
